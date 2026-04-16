@@ -23,7 +23,15 @@ async def main():
             return
 
         logger.warning("Processing your request...")
-        await agent.run(prompt)
+        result = await agent.run(prompt)
+        if result:
+            print(result)
+        if "ERROR_LOOP_GUARD" in result:
+            logger.error("Terminating with failure due to repetitive tool loop.")
+            raise SystemExit(2)
+        if "Terminated: Reached max steps" in result:
+            logger.error("Terminating with failure after max-steps exhaustion.")
+            raise SystemExit(2)
         logger.info("Request processing completed.")
     except KeyboardInterrupt:
         logger.warning("Operation interrupted.")

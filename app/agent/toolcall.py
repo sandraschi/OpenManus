@@ -1,5 +1,6 @@
 import asyncio
 import json
+import uuid
 from typing import Any, List, Optional, Union
 
 from pydantic import Field
@@ -8,7 +9,7 @@ from app.agent.react import ReActAgent
 from app.exceptions import TokenLimitExceeded
 from app.logger import logger
 from app.prompt.toolcall import NEXT_STEP_PROMPT, SYSTEM_PROMPT
-from app.schema import TOOL_CHOICE_TYPE, AgentState, Message, ToolCall, ToolChoice
+from app.schema import Function, TOOL_CHOICE_TYPE, AgentState, Message, ToolCall, ToolChoice
 from app.tool import CreateChatCompletion, Terminate, ToolCollection
 
 
@@ -35,6 +36,35 @@ class ToolCallAgent(ReActAgent):
 
     max_steps: int = 30
     max_observe: Optional[Union[int, bool]] = None
+    repetitive_tool_threshold: int = 4
+    _last_tool_signature: str = ""
+    _repetitive_tool_count: int = 0
+
+    def _parse_tool_call_from_content(self, content: str) -> List[ToolCall]:
+        """Best-effort parser for models that emit tool-call JSON in plain text."""
+        content = (content or "").strip()
+        if not content or not content.startswith("{"):
+            return []
+        try:
+            data = json.loads(content)
+        except Exception:
+            return []
+        if not isinstance(data, dict):
+            return []
+        name = data.get("name")
+        arguments = data.get("arguments", data.get("parameters", {}))
+        if not isinstance(name, str) or not name:
+            return []
+        if name not in self.available_tools.tool_map:
+            return []
+        if not isinstance(arguments, dict):
+            arguments = {}
+        return [
+            ToolCall(
+                id=str(uuid.uuid4()),
+                function=Function(name=name, arguments=json.dumps(arguments, ensure_ascii=False)),
+            )
+        ]
 
     async def think(self) -> bool:
         """Process current state and decide next actions using tools"""
@@ -77,6 +107,15 @@ class ToolCallAgent(ReActAgent):
         )
         content = response.content if response and response.content else ""
 
+        if not tool_calls and content:
+            parsed_calls = self._parse_tool_call_from_content(content)
+            if parsed_calls:
+                tool_calls = parsed_calls
+                self.tool_calls = parsed_calls
+                logger.info(
+                    f"🧩 Parsed tool call from plain content: {parsed_calls[0].function.name}"
+                )
+
         # Log response info
         logger.info(f"✨ {self.name}'s thoughts: {content}")
         logger.info(
@@ -114,8 +153,10 @@ class ToolCallAgent(ReActAgent):
             if self.tool_choices == ToolChoice.REQUIRED and not self.tool_calls:
                 return True  # Will be handled in act()
 
-            # For 'auto' mode, continue with content if no commands but content exists
+            # For 'auto' mode, terminate cleanly when model returns plain content
+            # without structured tool calls.
             if self.tool_choices == ToolChoice.AUTO and not self.tool_calls:
+                self.state = AgentState.FINISHED
                 return bool(content)
 
             return bool(self.tool_calls)
@@ -141,6 +182,49 @@ class ToolCallAgent(ReActAgent):
         for command in self.tool_calls:
             # Reset base64_image for each tool call
             self._current_base64_image = None
+
+            # Guard against repetitive local-model loops (same tool+args repeatedly).
+            sig = f"{command.function.name}:{command.function.arguments}"
+            if sig == self._last_tool_signature:
+                self._repetitive_tool_count += 1
+            else:
+                self._last_tool_signature = sig
+                self._repetitive_tool_count = 1
+            if self._repetitive_tool_count >= self.repetitive_tool_threshold:
+                logger.error(
+                    "ERROR_LOOP_GUARD: repetitive tool pattern detected; "
+                    "attempting final answer fallback."
+                )
+                try:
+                    fallback_prompt = (
+                        "Tool execution appears repetitive. "
+                        "Provide a concise final answer to the user request now. "
+                        "Do not call tools and do not output JSON."
+                    )
+                    final_answer = await self.llm.ask(
+                        messages=self.messages + [Message.user_message(fallback_prompt)],
+                        system_msgs=(
+                            [Message.system_message(self.system_prompt)]
+                            if self.system_prompt
+                            else None
+                        ),
+                        stream=False,
+                    )
+                    final_answer = (final_answer or "").strip()
+                    if final_answer:
+                        self.memory.add_message(Message.assistant_message(final_answer))
+                        self.state = AgentState.FINISHED
+                        return final_answer
+                except Exception as exc:
+                    logger.error(f"Loop fallback failed: {exc}")
+
+                msg = (
+                    "ERROR_LOOP_GUARD: repetitive tool pattern detected; "
+                    "terminating to avoid non-productive loops."
+                )
+                self.memory.add_message(Message.assistant_message(msg))
+                self.state = AgentState.FINISHED
+                return msg
 
             result = await self.execute_tool(command)
 
