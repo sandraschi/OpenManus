@@ -8,6 +8,7 @@ import asyncio
 import base64
 import io
 import os
+import sys
 import time
 from typing import Dict, Literal, Optional
 
@@ -118,6 +119,25 @@ class LocalComputerUse(BaseTool):
 
     _mouse_x: int = 0
     _mouse_y: int = 0
+    _confirmed: bool = False
+
+    async def _require_confirmation(self, action: str, detail: str = "") -> bool:
+        """Prompt user for confirmation of sensitive actions."""
+        if self._confirmed:
+            return True
+        print(f"\n⚠️  SECURITY: {action} requested")
+        if detail:
+            print(f"   Detail: {detail}")
+        print(f"   Allow this action? (y/N): ", end="", flush=True)
+        try:
+            loop = asyncio.get_event_loop()
+            resp = await loop.run_in_executor(None, lambda: sys.stdin.readline().strip().lower())
+            if resp == "y":
+                self._confirmed = True
+                return True
+            return False
+        except Exception:
+            return False
 
     async def execute(
         self,
@@ -141,6 +161,22 @@ class LocalComputerUse(BaseTool):
             return ToolResult(error="win32api not available on this platform")
 
         try:
+            # Confirmation gates for sensitive operations
+            if action in ("type", "press", "hotkey") and not self._confirmed:
+                detail = f"action={action}"
+                if action == "type" and text:
+                    detail = f"text='{text[:50]}...' " if len(text or "") > 50 else f"text='{text}'"
+                if action == "hotkey" and keys:
+                    detail = f"keys={keys}"
+                ok = await self._require_confirmation(f"Keyboard input: {action}", detail)
+                if not ok:
+                    return ToolResult(output="BLOCKED: keyboard action requires user confirmation")
+
+            if action == "screenshot" and not self._confirmed:
+                ok = await self._require_confirmation("Screen capture", "Full desktop screenshot")
+                if not ok:
+                    return ToolResult(output="BLOCKED: screenshot requires user confirmation")
+
             if action == "move":
                 return await self._move(x, y)
             elif action == "click":

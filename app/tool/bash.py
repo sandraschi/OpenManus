@@ -1,16 +1,74 @@
 import asyncio
 import os
+import re
 from typing import Optional
 
 from app.exceptions import ToolError
 from app.tool.base import BaseTool, CLIResult
-
 
 _BASH_DESCRIPTION = """Execute a bash command in the terminal.
 * Long running commands: For commands that may run indefinitely, it should be run in the background and the output should be redirected to a file, e.g. command = `python3 app.py > server.log 2>&1 &`.
 * Interactive: If a bash command returns exit code `-1`, this means the process is not yet finished. The assistant must then send a second call to terminal with an empty `command` (which will retrieve any additional logs), or it can send additional text (set `command` to the text) to STDIN of the running process, or it can send command=`ctrl+c` to interrupt the process.
 * Timeout: If a command execution result says "Command timed out. Sending SIGINT to the process", the assistant should retry running the command in the background.
 """
+
+DENY_PATTERNS = [
+    # Destructive disk operations
+    r"^\s*rm\s+-rf\s+/\s*$",
+    r"^\s*rm\s+-rf\s+/boot",
+    r"^\s*rm\s+-rf\s+/etc",
+    r"^\s*rm\s+-rf\s+/usr",
+    r"^\s*rm\s+-rf\s+/var",
+    r"^\s*dd\s+if=/dev/",
+    r"^\s*dd\s+of=/dev/",
+    r"^\s*mkfs\.",
+    r"^\s*mkswap",
+    r"^\s*fdisk\s+/dev/",
+    r"^\s*parted\s+/dev/",
+    r"^\s*format\s+[a-z]:",
+    # Privilege escalation
+    r"^\s*net\s+user\s+\S+\s+\S+\s+/add",
+    r"^\s*net\s+localgroup\s+administrators?\s+\S+\s+/add",
+    r"^\s*usermod\s+-aG\s+(sudo|wheel|admin)",
+    r"^\s*useradd\s+",
+    r"^\s*passwd\s+",
+    r"^\s*chmod\s+4777",
+    r"^\s*chmod\s+777\s+/",
+    r"^\s*sudo\s+",
+    # Network exfiltration / tunneling
+    r"^\s*nc\s+-[a-z]*e\s+",
+    r"^\s*bash\s+-[ic]\s+",
+    r"^\s*sh\s+-[ic]\s+",
+    # Fork bomb / DoS
+    r":\(\)\s*\{",
+    r"^\s*while\s+true\s*;.*do\s+.*done",
+    # Cryptominers / malware download
+    r"curl.*(?:miner|xmrig|cryptonight)",
+    r"wget.*(?:miner|xmrig|cryptonight)",
+    # Registry / system config (Windows)
+    r"^\s*reg\s+(delete|add)\s+HK",
+]
+
+DENY_WARNINGS = {
+    "rm": "Recursive destructive deletion is blocked",
+    "dd": "Raw disk write operations are blocked",
+    "mkfs": "Filesystem creation is blocked",
+    "net user": "User account management is blocked",
+    "sudo": "Privilege escalation via sudo is blocked",
+    "chmod 4777": "SUID bit setting is blocked",
+}
+
+
+def _check_command_safety(command: str) -> str | None:
+    if not command or not command.strip():
+        return None
+    for pattern in DENY_PATTERNS:
+        if re.search(pattern, command, re.IGNORECASE):
+            for key, warning in DENY_WARNINGS.items():
+                if key.lower() in command.lower():
+                    return f"BLOCKED by security policy: {warning}"
+            return "BLOCKED by security policy: command matches a denied pattern"
+    return None
 
 
 class _BashSession:
@@ -20,8 +78,8 @@ class _BashSession:
     _process: asyncio.subprocess.Process
 
     command: str = "/bin/bash"
-    _output_delay: float = 0.2  # seconds
-    _timeout: float = 120.0  # seconds
+    _output_delay: float = 0.2
+    _timeout: float = 120.0
     _sentinel: str = "<<exit>>"
 
     def __init__(self):
@@ -45,7 +103,6 @@ class _BashSession:
         self._started = True
 
     def stop(self):
-        """Terminate the bash shell."""
         if not self._started:
             raise ToolError("Session has not started.")
         if self._process.returncode is not None:
@@ -53,7 +110,6 @@ class _BashSession:
         self._process.terminate()
 
     async def run(self, command: str):
-        """Execute a command in the bash shell."""
         if not self._started:
             raise ToolError("Session has not started.")
         if self._process.returncode is not None:
@@ -66,29 +122,25 @@ class _BashSession:
                 f"timed out: bash has not returned in {self._timeout} seconds and must be restarted",
             )
 
-        # we know these are not None because we created the process with PIPEs
         assert self._process.stdin
         assert self._process.stdout
         assert self._process.stderr
 
-        # send command to the process
+        command_blocked = _check_command_safety(command)
+        if command_blocked:
+            return CLIResult(error=command_blocked, output="")
+
         self._process.stdin.write(
             command.encode() + f"; echo '{self._sentinel}'\n".encode()
         )
         await self._process.stdin.drain()
 
-        # read output from the process, until the sentinel is found
         try:
             async with asyncio.timeout(self._timeout):
                 while True:
                     await asyncio.sleep(self._output_delay)
-                    # if we read directly from stdout/stderr, it will wait forever for
-                    # EOF. use the StreamReader buffer directly instead.
-                    output = (
-                        self._process.stdout._buffer.decode()
-                    )  # pyright: ignore[reportAttributeAccessIssue]
+                    output = self._process.stdout._buffer.decode()
                     if self._sentinel in output:
-                        # strip the sentinel and break
                         output = output[: output.index(self._sentinel)]
                         break
         except asyncio.TimeoutError:
@@ -100,21 +152,18 @@ class _BashSession:
         if output.endswith("\n"):
             output = output[:-1]
 
-        error = (
-            self._process.stderr._buffer.decode()
-        )  # pyright: ignore[reportAttributeAccessIssue]
+        error = self._process.stderr._buffer.decode()
         if error.endswith("\n"):
             error = error[:-1]
 
-        # clear the buffers so that the next output can be read correctly
-        self._process.stdout._buffer.clear()  # pyright: ignore[reportAttributeAccessIssue]
-        self._process.stderr._buffer.clear()  # pyright: ignore[reportAttributeAccessIssue]
+        self._process.stdout._buffer.clear()
+        self._process.stderr._buffer.clear()
 
         return CLIResult(output=output, error=error)
 
 
 class Bash(BaseTool):
-    """A tool for executing bash commands"""
+    """A tool for executing bash commands with security filtering."""
 
     name: str = "bash"
     description: str = _BASH_DESCRIPTION
@@ -130,16 +179,19 @@ class Bash(BaseTool):
     }
 
     _session: Optional[_BashSession] = None
+    _warned: bool = False
 
     async def execute(
         self, command: str | None = None, restart: bool = False, **kwargs
     ) -> CLIResult:
+        if not self._warned:
+            self._warned = True
+
         if restart:
             if self._session:
                 self._session.stop()
             self._session = _BashSession()
             await self._session.start()
-
             return CLIResult(system="tool has been restarted.")
 
         if self._session is None:
@@ -150,9 +202,3 @@ class Bash(BaseTool):
             return await self._session.run(command)
 
         raise ToolError("no command provided.")
-
-
-if __name__ == "__main__":
-    bash = Bash()
-    rst = asyncio.run(bash.execute("ls -l"))
-    print(rst)
