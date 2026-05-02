@@ -137,6 +137,47 @@ For unstable multi-agent version, you also can run:
 python run_flow.py
 ```
 
+## Tools & Computer Use
+
+The default Manus agent now includes:
+
+| Tool | Name | What it does |
+|------|------|-------------|
+| Python execution | `python_execute` | Run Python code with restricted builtins (os/subprocess/socket imports blocked) |
+| Web browsing | `browser_use` | Playwright-based browser automation |
+| File editing | `str_replace_editor` | View/create/replace files (scoped to workspace root) |
+| **Shell** | **`bash`** | **Full terminal with security denylist** |
+| **Desktop control** | **`computer`** | **Windows-native mouse/keyboard/screenshot via win32 API** |
+| Web search | `web_search` | Google/Bing/DDG search |
+| Human input | `ask_human` | Ask for user input |
+| Termination | `terminate` | Stop the agent |
+
+### Security Hardening
+
+This fork adds multiple security layers beyond upstream OpenManus:
+
+- **Bash denylist**: regex patterns block `rm -rf /`, `sudo`, `dd`, `mkfs`, `useradd`, `net user`, `chmod 4777`, fork bombs, cryptominers, and network exfiltration. Obfuscation detection decodes hex/octal/printf/ANSI-C quoting before checking.
+- **Python sandbox**: restricted builtins only; `import os/subprocess/socket` blocked; `eval/exec` blocked; system-path writes blocked.
+- **Computer use gate**: keyboard input and screenshots require interactive terminal confirmation (`y/N`). Blocked in headless mode.
+- **API authentication**: optional `Bearer` token gate on REST API.
+
+See [SECURITY.md](SECURITY.md) for full details.
+
+### Computer Use (Windows Native)
+
+The `computer` tool provides desktop automation without requiring a Daytona sandbox or Docker:
+
+```python
+# Example actions
+computer.move(100, 200)        # Move mouse
+computer.click(x=500, y=300)   # Left click
+computer.type(text="hello")    # Type text
+computer.screenshot()          # Capture screen
+computer.hotkey("ctrl+s")      # Save file
+```
+
+On first use, keyboard and screenshot actions prompt for confirmation.
+
 ### Custom Adding Multiple Agents
 
 Currently, besides the general OpenManus Agent, we have also integrated the DataAnalysis Agent, which is suitable for data analysis and data visualization tasks. You can add this agent to `run_flow` in `config.toml`.
