@@ -167,9 +167,18 @@ class StrReplaceEditor(BaseTool):
         self, command: str, path: Path, operator: FileOperator
     ) -> None:
         """Validate path and command combination based on execution environment."""
-        # Check if path is absolute
         if not path.is_absolute():
             raise ToolError(f"The path {path} is not an absolute path")
+
+        # Scope file operations to workspace root
+        resolved = path.resolve()
+        ws = config.workspace_root.resolve()
+        try:
+            resolved.relative_to(ws)
+        except ValueError:
+            raise ToolError(
+                f"Access denied: path '{resolved}' is outside the workspace root '{ws}'"
+            )
 
         # Only check if path exists for non-create commands
         if command != "create":

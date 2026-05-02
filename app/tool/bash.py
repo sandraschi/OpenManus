@@ -59,15 +59,113 @@ DENY_WARNINGS = {
 }
 
 
+_OBFUSCATION_PATTERNS = [
+    r"\\x[0-9a-fA-F]{2}",       # hex escape \x2d
+    r"\\[0-7]{3}",               # octal escape \0155
+    r"\$\(printf[^)]+\)",       # $(printf ...)
+    r"\$\(echo[^)]+\)",         # $(echo ...)
+    r"\$\(xxd[^)]+\)",          # $(xxd ...)
+    r"`printf[^`]+`",           # `printf ...`
+    r"`echo[^`]+`",             # `echo ...`
+    r'base64\s+-d',             # base64 decode
+    r"python\s+-c\s+['\"].*\\x",  # python -c with hex
+    r"perl\s+-e\s+['\"].*\\x",    # perl -e with hex
+    r"\$'[^']*\\x",              # $'...\x...' ANSI-C quoting
+    r"\$\{[^}]+\}",              # variable expansion ${...}
+]
+
+_DANGEROUS_KEYWORDS = [
+    "rm", "dd", "mkfs", "mkswap", "fdisk", "parted", "format",
+    "sudo", "su", "chmod", "chown", "useradd", "usermod", "passwd",
+    "net user", "net localgroup",
+    "nc -e", "bash -i", "sh -i",
+    ":(){", "while true",
+    "xmrig", "miner", "cryptonight",
+    "wget", "curl.*-O", "curl.*-o",
+    "reg delete", "reg add",
+    "> /dev/", "< /dev/",
+]
+
+
+def _normalize_command(cmd: str) -> str:
+    """Strip common shell obfuscation to reveal dangerous intent."""
+    normal = cmd
+
+    # Remove ANSI-C quoting wrapper: $'...'
+    normal = re.sub(r"\$'(.*?)'", lambda m: m.group(1), normal)
+
+    # Decode hex escapes \x2d -> -
+    try:
+        normal = re.sub(r"\\x([0-9a-fA-F]{2})", lambda m: chr(int(m.group(1), 16)), normal)
+    except Exception:
+        pass
+
+    # Decode octal escapes \0155 -> m
+    try:
+        normal = re.sub(r"\\([0-7]{3})", lambda m: chr(int(m.group(1), 8)), normal)
+    except Exception:
+        pass
+
+    # Resolve statically evaluable printf: $(printf '%s' 'rm') -> rm
+    normal = re.sub(
+        r'\$\(printf\s+([^)]+)\)',
+        lambda m: re.sub(r"'[^']*'\s*", "", m.group(1)).strip().strip("'\""),
+        normal,
+    )
+
+    # Resolve echo: $(echo 'rm') -> rm
+    normal = re.sub(
+        r'\$\(echo\s+([^)]+)\)',
+        lambda m: m.group(1).strip().strip("'\""),
+        normal,
+    )
+
+    # Remove backticks with simple commands
+    normal = re.sub(r'`([^`]+)`', lambda m: m.group(1).strip().strip("'\""), normal)
+
+    return normal
+
+
+def _has_obfuscation(cmd: str) -> bool:
+    """Check if command uses obfuscation techniques."""
+    return any(re.search(p, cmd) for p in _OBFUSCATION_PATTERNS)
+
+
+def _has_dangerous_keyword(cmd: str) -> bool:
+    """Check if command contains dangerous keywords."""
+    cmd_lower = cmd.lower()
+    return any(kw.lower() in cmd_lower for kw in _DANGEROUS_KEYWORDS)
+
+
 def _check_command_safety(command: str) -> str | None:
     if not command or not command.strip():
         return None
+
+    cmd = command.strip()
+
+    # Check raw command against patterns
     for pattern in DENY_PATTERNS:
-        if re.search(pattern, command, re.IGNORECASE):
+        if re.search(pattern, cmd, re.IGNORECASE):
             for key, warning in DENY_WARNINGS.items():
-                if key.lower() in command.lower():
+                if key.lower() in cmd.lower():
                     return f"BLOCKED by security policy: {warning}"
             return "BLOCKED by security policy: command matches a denied pattern"
+
+    # If no obfuscation, we're done
+    if not _has_obfuscation(cmd):
+        return None
+
+    # Normalize and re-check for bypass attempts
+    normal = _normalize_command(cmd)
+
+    for pattern in DENY_PATTERNS:
+        if re.search(pattern, normal, re.IGNORECASE):
+            return "BLOCKED by security policy: obfuscated dangerous command detected"
+
+    # If obfuscation + dangerous keywords = likely attack
+    if _has_dangerous_keyword(cmd) or _has_dangerous_keyword(normal):
+        return "BLOCKED by security policy: obfuscation with dangerous keywords detected"
+
     return None
 
 

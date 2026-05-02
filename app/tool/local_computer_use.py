@@ -120,11 +120,19 @@ class LocalComputerUse(BaseTool):
     _mouse_x: int = 0
     _mouse_y: int = 0
     _confirmed: bool = False
+    _interactive: bool = True
+
+    def __init__(self, **data):
+        super().__init__(**data)
+        # Detect headless: no stdin TTY or NO_PROMPT env var set
+        self._interactive = sys.stdin.isatty() and not os.environ.get("LOCAL_COMPUTER_NO_PROMPT", "")
 
     async def _require_confirmation(self, action: str, detail: str = "") -> bool:
         """Prompt user for confirmation of sensitive actions."""
         if self._confirmed:
             return True
+        if not self._interactive:
+            return False
         print(f"\n⚠️  SECURITY: {action} requested")
         if detail:
             print(f"   Detail: {detail}")
